@@ -3,35 +3,34 @@ use std::ops::Rem;
 /// Size of a word in the bitvector.
 const WORD_SIZE: usize = 64;
 
-/// Size of a block in the bitvector. The size is deliberately chosen to fit one block into a
-/// AVX256 register, so that we can use SIMD instructions to speed up rank and select queries.
+/// Size of a block in the bitvector. The size is chosen so we have enough room for the L1 counters
+/// in super blocks left if we store 8 10-bit L2-counters in their 128 bit word
 const BLOCK_SIZE: usize = 512;
 
 /// Size of a super block in the bitvector. Super-blocks exist to decrease the memory overhead
-/// of block descriptors.
-/// Increasing or decreasing the super block size has negligible effect on performance. This
-/// means we want to make the super block size as large as possible, as long as the zero-counter
-/// in normal blocks still fits in a reasonable amount of bits. So we chose the super block size
-/// to be the largest power of two that still fits into a `u16`. Note that blocks store the number
-/// of zeros up to the block, so they will never overflow even if the entire vector contains only
-/// zeros.
-const SUPER_BLOCK_SIZE: usize = 1 << 16;
+/// of block descriptors. The size is chosen deliberately so we can store 44 bit of L1 counter and
+/// 8 10-bit L2 counters in a 128 bit word.
+const SUPER_BLOCK_SIZE: usize = 1 << 12;
 
-/// Meta-data for a block. The `zeros` field stores the number of zeros up to the block,
-/// beginning from the last super-block boundary. This means the first block in a super-block
-/// always stores the number zero, which serves as a sentinel value to avoid special-casing the
-/// first block in a super-block (which would be a performance hit due branch prediction failures).
-#[derive(Clone, Copy, Debug)]
-struct BlockDescriptor {
-    zeros: u16,
-}
+/// Maximum size of a bitvector. This is the maximum size of a bitvector that can be stored in
+/// memory. This limitation is due to the fact that super-blocks only reserve 44 bit for the
+/// zero-counter. This can in theory be increased by an L0-block with 2^44 bits covered.
+const MAX_SIZE: u64 = 1 << 44;
+
+const L2_COUNTER_LANE: usize = 84;
+
+const L2_COUNTER_LANE_MASK: u128 = 0x0000_0000_000f_ffff_ffff_ffff_ffff_ffff;
+
+const L2_COUNTER_SIZE: usize = 12;
+
+const L2_COUNTER_MASK: usize = 0xfff;
 
 /// Meta-data for a super-block. The `zeros` field stores the number of zeros up to this super-block.
 /// This allows the `BlockDescriptor` to store the number of zeros in a much smaller
 /// space. The `zeros` field is the number of zeros up to the super-block.
 #[derive(Clone, Copy, Debug)]
-struct SuperBlockDescriptor {
-    zeros: usize,
+struct InterleavedBlockDescriptor {
+    interleaved: u128,
 }
 
 /// A bitvector that supports constant-time rank and select queries. The bitvector is stored as
@@ -42,8 +41,7 @@ struct SuperBlockDescriptor {
 pub struct BitVector {
     data: Vec<u64>,
     len: usize,
-    blocks: Vec<BlockDescriptor>,
-    super_blocks: Vec<SuperBlockDescriptor>,
+    interleaved_blocks: Vec<InterleavedBlockDescriptor>,
 }
 
 impl BitVector {
@@ -79,29 +77,32 @@ impl BitVector {
     // branch elimination profits alone should make it worth it.
     #[inline(always)]
     fn rank(&self, zero: bool, pos: usize) -> usize {
-        #[allow(unused_variables)]
         let index = pos / WORD_SIZE;
-        let block_index = pos / BLOCK_SIZE;
         let super_block_index = pos / SUPER_BLOCK_SIZE;
-        let mut rank = 0;
+        let mut rank = 0usize;
 
         // at first add the number of zeros/ones before the current super block
         rank += if zero {
-            self.super_blocks[super_block_index].zeros
+            (self.interleaved_blocks[super_block_index].interleaved >> L2_COUNTER_LANE) as usize
         } else {
-            (super_block_index * SUPER_BLOCK_SIZE) - self.super_blocks[super_block_index].zeros
+            (super_block_index * SUPER_BLOCK_SIZE) - (self.interleaved_blocks[super_block_index].interleaved >> L2_COUNTER_LANE) as usize
         };
 
-        // then add the number of zeros/ones before the current block
+        // then add the number of zeros/ones before the current block by extracting the information
+        // from the interleaved block descriptor. The information is stored in reverse order to
+        // avoid a boundary check for the first block that would mess with the branch prediction.
+        let block_index = (pos % SUPER_BLOCK_SIZE) / BLOCK_SIZE;
+        let shift_index = L2_COUNTER_LANE - (L2_COUNTER_SIZE * block_index);
+        let zeros_in_block = ((self.interleaved_blocks[super_block_index].interleaved & L2_COUNTER_LANE_MASK) >> shift_index) as usize & L2_COUNTER_MASK;
+
         rank += if zero {
-            self.blocks[block_index].zeros as usize
+            zeros_in_block as usize
         } else {
-            ((block_index % (SUPER_BLOCK_SIZE / BLOCK_SIZE)) * BLOCK_SIZE)
-                - self.blocks[block_index].zeros as usize
+            block_index * BLOCK_SIZE - zeros_in_block
         };
 
-        // naive popcount of blocks
-        for &i in &self.data[(block_index * BLOCK_SIZE) / WORD_SIZE..index] {
+        // naive popcount of remaining words
+        for &i in &self.data[((super_block_index * SUPER_BLOCK_SIZE) + (block_index * BLOCK_SIZE)) / WORD_SIZE..index] {
             rank += if zero {
                 i.count_zeros() as usize
             } else {
@@ -160,8 +161,8 @@ impl BitVectorBuilder {
 
     /// Append a bit to the vector.
     pub fn append_bit<T: Rem + From<u8>>(&mut self, bit: T)
-    where
-        T::Output: Into<u64>,
+        where
+            T::Output: Into<u64>,
     {
         let bit: u64 = (bit % T::from(2u8)).into();
 
@@ -187,36 +188,44 @@ impl BitVectorBuilder {
     /// Build the `BitVector` from all bits that have been appended so far. This will consume the
     /// `BitVectorBuilder`.
     pub fn build(mut self) -> BitVector {
+        if self.len > MAX_SIZE.try_into().unwrap_or(usize::MAX) {
+            panic!("BitVector cannot be larger than {} bits", MAX_SIZE);
+        }
+
         // Construct the block descriptor meta data. Each block descriptor contains the number of
         // zeros in the super-block, up to but excluding the block.
-        let mut blocks = Vec::with_capacity(self.len / BLOCK_SIZE + 1);
+        // let mut blocks = Vec::with_capacity(self.len / BLOCK_SIZE + 1);
         let mut super_blocks = Vec::with_capacity(self.len / SUPER_BLOCK_SIZE + 1);
 
-        let mut total_zeros: usize = 0;
-        let mut current_zeros: u32 = 0;
+        let mut total_zeros_before: u128 = 0;
+        let mut current_super_block_zeros: u32 = 0;
+        let mut l2_counter_lane: u128 = 0;
         for (idx, &word) in self.words.iter().enumerate() {
             // if we moved past a block boundary, append the block information for the previous
-            // block and reset the counter if we moved past a super-block boundary.
-            if idx % (BLOCK_SIZE / WORD_SIZE) == 0 {
-                if idx % (SUPER_BLOCK_SIZE / WORD_SIZE) == 0 {
-                    total_zeros += current_zeros as usize;
-                    current_zeros = 0;
-                    super_blocks.push(SuperBlockDescriptor { zeros: total_zeros });
+            // block to the counter lane, or append a super-block descriptor if we moved past
+            // a super-block boundary. Reset the counters in the latter case.
+            if idx > 0 && idx % (SUPER_BLOCK_SIZE / WORD_SIZE) == 0 {
+                let interleaved = (total_zeros_before << L2_COUNTER_LANE) | l2_counter_lane;
+                super_blocks.push(InterleavedBlockDescriptor { interleaved });
+                total_zeros_before += current_super_block_zeros as u128;
+                current_super_block_zeros = 0;
+                l2_counter_lane = 0;
+            } else {
+                if idx > 0 && idx % (BLOCK_SIZE / WORD_SIZE) == 0 {
+                    l2_counter_lane = (l2_counter_lane << L2_COUNTER_SIZE) | (current_super_block_zeros as u128);
                 }
-
-                // this cannot overflow because the only block where it could (the last in a super-
-                // block) is not added to the list of blocks
-                #[allow(clippy::cast_possible_truncation)]
-                blocks.push(BlockDescriptor {
-                    zeros: current_zeros as u16,
-                });
             }
 
-            // count the zeros in the current word and add them to the counter
+            // count the zeros in the current word and add them to the block counter
             // the last word may contain padding zeros, which should not be counted,
             // but since we do not append the last block descriptor, this is not a problem
-            current_zeros += word.count_zeros();
+            current_super_block_zeros += word.count_zeros();
         }
+
+        // push last incomplete block. It is missing the last L2 counter, but this will never be
+        // accessed, so we can ignore it
+        let interleaved = (total_zeros_before << L2_COUNTER_LANE) | l2_counter_lane;
+        super_blocks.push(InterleavedBlockDescriptor { interleaved });
 
         // pad the internal vector to be block-aligned, so SIMD operations don't try to read
         // past the end of the vector. Note that this does not affect the content of the vector,
@@ -228,8 +237,7 @@ impl BitVectorBuilder {
         BitVector {
             data: self.words,
             len: self.len,
-            blocks,
-            super_blocks,
+            interleaved_blocks: super_blocks,
         }
     }
 }
